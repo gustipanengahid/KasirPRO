@@ -18,7 +18,7 @@ _Solusi cerdas untuk mengelola penjualan, produk, stok, transaksi, dan pengguna 
 <!-- Social Media Badges -->
 
 [![Instagram](https://img.shields.io/badge/Instagram-E4405F?style=for-the-badge&logo=instagram&logoColor=white)](https://instagram.com/gustipanenggah:_)
-[![TikTok](https://img.shields.io/badge/TikTok-000000?style=for-the-badge&logo=tiktok&logoColor=white)](https://tiktok.com/@ugustipanengah)
+[![TikTok](https://img.shields.io/badge/TikTok-000000?style=for-the-badge&logo=tiktok&logoColor=white)](https://tiktok.com/@gustipanengah)
 
 </div>
 
