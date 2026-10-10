@@ -1,0 +1,222 @@
+-- ==========================================
+-- 0. AKTIFKAN EKSTENSI YANG DIBUTUHKAN
+-- ==========================================
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+
+-- ==========================================
+-- 1. PEMBUATAN TABEL (SCHEMA)
+-- ==========================================
+
+-- Tabel: categories
+CREATE TABLE IF NOT EXISTS public.categories (
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    PRIMARY KEY (id)
+);
+
+-- Tabel: items
+CREATE TABLE IF NOT EXISTS public.items (
+    id UUID NOT NULL DEFAULT uuid_generate_v4(),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    sku TEXT,
+    name TEXT NOT NULL,
+    category TEXT,
+    price NUMERIC DEFAULT 0,
+    cost_price NUMERIC DEFAULT 0,
+    stock NUMERIC DEFAULT 0,
+    min_stock NUMERIC DEFAULT 0,
+    unit TEXT,
+    image_url TEXT,
+    PRIMARY KEY (id)
+);
+
+-- Tabel: promos
+CREATE TABLE IF NOT EXISTS public.promos (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL,
+    value NUMERIC NOT NULL,
+    min_purchase NUMERIC DEFAULT 0,
+    max_discount NUMERIC,
+    start_date TIMESTAMP WITH TIME ZONE,
+    end_date TIMESTAMP WITH TIME ZONE,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    PRIMARY KEY (id)
+);
+
+-- Tabel: settings
+CREATE TABLE IF NOT EXISTS public.settings (
+    id BIGINT NOT NULL,
+    name TEXT NOT NULL,
+    address TEXT,
+    phone TEXT,
+    istaxenabled BOOLEAN DEFAULT false,
+    taxpercentage NUMERIC DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    PRIMARY KEY (id)
+);
+
+-- Tabel: transactions
+CREATE TABLE IF NOT EXISTS public.transactions (
+    id TEXT NOT NULL,
+    invoice_number TEXT NOT NULL,
+    total NUMERIC DEFAULT 0,
+    total_amount NUMERIC DEFAULT 0,
+    sub_total NUMERIC DEFAULT 0,
+    discount_total NUMERIC DEFAULT 0,
+    tax_total NUMERIC DEFAULT 0,
+    cash_amount NUMERIC DEFAULT 0,
+    change_amount NUMERIC DEFAULT 0,
+    payment_method TEXT,
+    cashier_id TEXT,
+    cashier_name TEXT,
+    items_json JSONB,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    PRIMARY KEY (id)
+);
+
+-- Tabel: users (Terhubung dengan Supabase Auth)
+CREATE TABLE IF NOT EXISTS public.users (
+    id UUID NOT NULL DEFAULT uuid_generate_v4(),
+    auth_id UUID REFERENCES auth.users(id) ON DELETE CASCADE,
+    username TEXT NOT NULL,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'cashier'::text,
+    active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    PRIMARY KEY (id)
+);
+
+
+-- ==========================================
+-- 2. OTOMATISASI USER DARI AUTHENTICATION
+-- ==========================================
+
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public, extensions
+AS $$
+BEGIN
+  INSERT INTO public.users (id, auth_id, username, name, role, active, created_at)
+  VALUES (
+    gen_random_uuid(),
+    NEW.id,
+    COALESCE(NEW.raw_user_meta_data ->> 'username', split_part(NEW.email, '@', 1)),
+    COALESCE(NEW.raw_user_meta_data ->> 'name', 'New User'),
+    COALESCE(NEW.raw_user_meta_data ->> 'role', 'cashier'),
+    true,
+    NOW()
+  );
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+
+-- ==========================================
+-- 3. FUNGSI ADMIN RESET PASSWORD (RPC AMAN)
+-- ==========================================
+
+CREATE OR REPLACE FUNCTION public.admin_reset_user_password(
+    new_password TEXT,
+    target_user_id UUID
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public, extensions
+AS $$
+DECLARE
+  caller_role TEXT;
+BEGIN
+  -- Cek role user yang sedang memanggil fungsi ini
+  SELECT role INTO caller_role 
+  FROM public.users 
+  WHERE auth_id = auth.uid();
+
+  IF caller_role != 'admin' THEN
+    RAISE EXCEPTION 'Akses ditolak: Hanya admin yang dapat mereset password.';
+  END IF;
+
+  -- Mengupdate password pada tabel bawaan auth.users milik Supabase
+  UPDATE auth.users
+  SET encrypted_password = crypt(new_password, gen_salt('bf'))
+  WHERE id = target_user_id;
+END;
+$$;
+
+
+-- ==========================================
+-- 4. RLS POLICY (DIAMANKAN UNTUK PENGGUNA TEROTENTIKASI)
+-- ==========================================
+
+ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE promos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+
+-- Hapus policy lama
+DROP POLICY IF EXISTS "allow_all_categories" ON categories;
+DROP POLICY IF EXISTS "allow_all_items" ON items;
+DROP POLICY IF EXISTS "allow_all_promos" ON promos;
+DROP POLICY IF EXISTS "allow_all_settings" ON settings;
+DROP POLICY IF EXISTS "allow_all_transactions" ON transactions;
+DROP POLICY IF EXISTS "allow_all_users" ON users;
+
+-- Akses Publik (Anonim) hanya bisa Membaca Menu/Produk (Untuk Public Menu)
+CREATE POLICY "Public Read Categories" ON categories FOR SELECT USING (true);
+CREATE POLICY "Public Read Items" ON items FOR SELECT USING (true);
+CREATE POLICY "Public Read Promos" ON promos FOR SELECT USING (is_active = true);
+CREATE POLICY "Public Read Settings" ON settings FOR SELECT USING (true);
+
+-- Pengguna Terautentikasi (Kasir / Admin) memiliki akses Penuh
+CREATE POLICY "Auth Manage Categories" ON categories FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Items" ON items FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Promos" ON promos FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Settings" ON settings FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Transactions" ON transactions FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Users" ON users FOR ALL TO authenticated USING (true) WITH CHECK (true);
+
+
+-- ==========================================
+-- 5. INSERT DATA DEFAULT (SETTINGS)
+-- ==========================================
+
+INSERT INTO settings (id, name, address, phone, istaxenabled, taxpercentage, created_at, updated_at)
+VALUES (
+    1,
+    'Gusti Panengah',
+    'Mojolaban',
+    '085842885498',
+    false,
+    0,
+    NOW(),
+    NOW()
+)
+ON CONFLICT (id) DO UPDATE 
+SET name = EXCLUDED.name,
+    address = EXCLUDED.address,
+    phone = EXCLUDED.phone,
+    istaxenabled = EXCLUDED.istaxenabled,
+    taxpercentage = EXCLUDED.taxpercentage,
+    updated_at = NOW();
+
+
+-- ==========================================
+-- 6. REFRESH SCHEMA CACHE
+-- ==========================================
+NOTIFY pgrst, 'reload schema';
