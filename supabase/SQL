@@ -1,0 +1,389 @@
+-- ==========================================
+-- 0. AKTIFKAN EKSTENSI YANG DIBUTUHKAN
+-- ==========================================
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+
+-- ==========================================
+-- 1. PEMBUATAN TABEL (SCHEMA)
+-- ==========================================
+
+-- Tabel: categories
+CREATE TABLE IF NOT EXISTS public.categories (
+    id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    PRIMARY KEY (id)
+);
+
+-- Tabel: items
+CREATE TABLE IF NOT EXISTS public.items (
+    id UUID NOT NULL DEFAULT uuid_generate_v4(),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    sku TEXT,
+    name TEXT NOT NULL,
+    category TEXT,
+    price NUMERIC DEFAULT 0,
+    cost_price NUMERIC DEFAULT 0,
+    stock NUMERIC DEFAULT 0,
+    min_stock NUMERIC DEFAULT 0,
+    unit TEXT,
+    image_url TEXT,
+    PRIMARY KEY (id)
+);
+
+-- Tabel: promos
+CREATE TABLE IF NOT EXISTS public.promos (
+    id UUID NOT NULL DEFAULT gen_random_uuid(),
+    code TEXT NOT NULL,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL,
+    value NUMERIC NOT NULL,
+    min_purchase NUMERIC DEFAULT 0,
+    max_discount NUMERIC,
+    start_date TIMESTAMP WITH TIME ZONE,
+    end_date TIMESTAMP WITH TIME ZONE,
+    is_active BOOLEAN DEFAULT true,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    PRIMARY KEY (id)
+);
+
+-- Tabel: settings (Pengaturan Toko Umum)
+CREATE TABLE IF NOT EXISTS public.settings (
+    id BIGINT NOT NULL,
+    name TEXT NOT NULL,
+    address TEXT,
+    phone TEXT,
+    istaxenabled BOOLEAN DEFAULT false,
+    taxpercentage NUMERIC DEFAULT 0,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    PRIMARY KEY (id)
+);
+
+-- Tabel: store_settings (Penyimpanan Key-Value Dinamis)
+CREATE TABLE IF NOT EXISTS public.store_settings (
+    id SERIAL PRIMARY KEY,
+    key TEXT UNIQUE NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now())
+);
+
+-- Tabel: transactions
+CREATE TABLE IF NOT EXISTS public.transactions (
+    id TEXT NOT NULL,
+    invoice_number TEXT NOT NULL,
+    total NUMERIC DEFAULT 0,
+    total_amount NUMERIC DEFAULT 0,
+    sub_total NUMERIC DEFAULT 0,
+    discount_total NUMERIC DEFAULT 0,
+    tax_total NUMERIC DEFAULT 0,
+    cash_amount NUMERIC DEFAULT 0,
+    change_amount NUMERIC DEFAULT 0,
+    payment_method TEXT,
+    cashier_id TEXT,
+    cashier_name TEXT,
+    items_json JSONB,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    PRIMARY KEY (id)
+);
+
+-- Tabel: users (Terhubung dengan Supabase Auth & Ditambahkan Unique Constraint)
+CREATE TABLE IF NOT EXISTS public.users (
+    id UUID NOT NULL DEFAULT uuid_generate_v4(),
+    auth_id UUID UNIQUE REFERENCES auth.users(id) ON DELETE CASCADE,
+    username TEXT NOT NULL,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'cashier'::text,
+    active BOOLEAN DEFAULT true,
+    avatar_url TEXT,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT timezone('utc'::text, now()),
+    PRIMARY KEY (id)
+);
+
+
+-- ==========================================
+-- 2. KONFIGURASI STORAGE BUCKET (AVATARS)
+-- ==========================================
+INSERT INTO storage.buckets (id, name, public)
+VALUES ('avatars', 'avatars', true)
+ON CONFLICT (id) DO UPDATE SET public = true;
+
+-- Hapus policy lama jika ada untuk menghindari duplikasi
+DROP POLICY IF EXISTS "Avatar Public Access" ON storage.objects;
+DROP POLICY IF EXISTS "Avatar Authenticated Upload" ON storage.objects;
+DROP POLICY IF EXISTS "Avatar Authenticated Update" ON storage.objects;
+DROP POLICY IF EXISTS "Avatar Authenticated Delete" ON storage.objects;
+
+-- Buat policy akses publik dan autentikasi untuk bucket avatars
+CREATE POLICY "Avatar Public Access"
+ON storage.objects FOR SELECT
+USING (bucket_id = 'avatars');
+
+CREATE POLICY "Avatar Authenticated Upload"
+ON storage.objects FOR INSERT
+TO authenticated
+WITH CHECK (bucket_id = 'avatars');
+
+CREATE POLICY "Avatar Authenticated Update"
+ON storage.objects FOR UPDATE
+TO authenticated
+USING (bucket_id = 'avatars');
+
+CREATE POLICY "Avatar Authenticated Delete"
+ON storage.objects FOR DELETE
+TO authenticated
+USING (bucket_id = 'avatars');
+
+
+-- ==========================================
+-- 3. OTOMATISASI USER DARI AUTHENTICATION
+-- ==========================================
+
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public, extensions
+AS $$
+DECLARE
+  v_username TEXT;
+  v_name TEXT;
+  v_avatar TEXT;
+BEGIN
+  v_username := COALESCE(NEW.raw_user_meta_data ->> 'username', split_part(NEW.email, '@', 1));
+  v_name := COALESCE(NEW.raw_user_meta_data ->> 'name', v_username);
+  v_avatar := NEW.raw_user_meta_data ->> 'avatar_url';
+
+  INSERT INTO public.users (id, auth_id, username, name, role, active, avatar_url, created_at)
+  VALUES (
+    gen_random_uuid(),
+    NEW.id,
+    v_username,
+    v_name,
+    COALESCE(NEW.raw_user_meta_data ->> 'role', 'cashier'),
+    true,
+    v_avatar,
+    NOW()
+  )
+  ON CONFLICT (auth_id) DO UPDATE
+  SET username = EXCLUDED.username,
+      name = EXCLUDED.name,
+      role = EXCLUDED.role,
+      avatar_url = COALESCE(EXCLUDED.avatar_url, public.users.avatar_url);
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS on_auth_user_created ON auth.users;
+
+CREATE TRIGGER on_auth_user_created
+  AFTER INSERT ON auth.users
+  FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+
+-- ==========================================
+-- 4. FUNGSI ADMIN & OWNER (RESET PASSWORD)
+-- ==========================================
+
+-- Hapus fungsi admin_create_user jika sebelumnya pernah ada
+DROP FUNCTION IF EXISTS public.admin_create_user(TEXT, TEXT, TEXT, TEXT, TEXT, TEXT);
+
+CREATE OR REPLACE FUNCTION public.admin_reset_user_password(
+    new_password TEXT,
+    target_user_id UUID
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public, extensions
+AS $$
+DECLARE
+  caller_role TEXT;
+BEGIN
+  SELECT role INTO caller_role
+  FROM public.users
+  WHERE auth_id = auth.uid();
+
+  IF caller_role != 'admin' AND caller_role != 'owner' THEN
+    RAISE EXCEPTION 'Akses ditolak: Hanya admin atau owner yang dapat mereset password.';
+  END IF;
+
+  UPDATE auth.users
+  SET encrypted_password = crypt(new_password, gen_salt('bf'))
+  WHERE id = target_user_id;
+END;
+$$;
+
+
+-- ==========================================
+-- 5. RLS POLICY (DIAMANKAN UNTUK PENGGUNA TEROTENTIKASI)
+-- ==========================================
+
+ALTER TABLE categories ENABLE ROW LEVEL SECURITY;
+ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+ALTER TABLE promos ENABLE ROW LEVEL SECURITY;
+ALTER TABLE settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE store_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE transactions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE users ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Public Read Categories" ON categories;
+DROP POLICY IF EXISTS "Public Read Items" ON items;
+DROP POLICY IF EXISTS "Public Read Promos" ON promos;
+DROP POLICY IF EXISTS "Public Read Settings" ON settings;
+DROP POLICY IF EXISTS "Public Read Store Settings" ON store_settings;
+
+DROP POLICY IF EXISTS "Auth Manage Categories" ON categories;
+DROP POLICY IF EXISTS "Auth Manage Items" ON items;
+DROP POLICY IF EXISTS "Auth Manage Promos" ON promos;
+DROP POLICY IF EXISTS "Auth Manage Settings" ON settings;
+DROP POLICY IF EXISTS "Auth Manage Store Settings" ON store_settings;
+DROP POLICY IF EXISTS "Auth Manage Transactions" ON transactions;
+DROP POLICY IF EXISTS "Auth Manage Users" ON users;
+
+CREATE POLICY "Public Read Categories" ON categories FOR SELECT USING (true);
+CREATE POLICY "Public Read Items" ON items FOR SELECT USING (true);
+CREATE POLICY "Public Read Promos" ON promos FOR SELECT USING (is_active = true);
+CREATE POLICY "Public Read Settings" ON settings FOR SELECT USING (true);
+CREATE POLICY "Public Read Store Settings" ON store_settings FOR SELECT USING (true);
+
+CREATE POLICY "Auth Manage Categories" ON categories FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Items" ON items FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Promos" ON promos FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Settings" ON settings FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Store Settings" ON store_settings FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Transactions" ON transactions FOR ALL TO authenticated USING (true) WITH CHECK (true);
+CREATE POLICY "Auth Manage Users" ON users FOR ALL TO authenticated USING (true) WITH CHECK (true);
+
+
+-- ==========================================
+-- 6. INSERT DATA DEFAULT
+-- ==========================================
+INSERT INTO settings (id, name, address, phone, istaxenabled, taxpercentage, created_at, updated_at)
+VALUES (
+    1,
+    'Gusti Panengah',
+    'Mojolaban',
+    '085842885498',
+    false,
+    0,
+    NOW(),
+    NOW()
+)
+ON CONFLICT (id) DO UPDATE
+SET name = EXCLUDED.name,
+    address = EXCLUDED.address,
+    phone = EXCLUDED.phone,
+    istaxenabled = EXCLUDED.istaxenabled,
+    taxpercentage = EXCLUDED.taxpercentage,
+    updated_at = NOW();
+
+INSERT INTO store_settings (key, value)
+VALUES ('monthly_target', '10000000')
+ON CONFLICT (key) DO NOTHING;
+
+
+-- ==========================================
+-- 7. FUNGSI ATOMIK CHECKOUT KASIR (RPC)
+-- ==========================================
+CREATE OR REPLACE FUNCTION public.process_checkout(
+  p_transaction_id TEXT,
+  p_invoice_number TEXT,
+  p_sub_total NUMERIC,
+  p_discount_total NUMERIC,
+  p_tax_total NUMERIC,
+  p_total NUMERIC,
+  p_payment_method TEXT,
+  p_cashier_id TEXT,
+  p_cashier_name TEXT,
+  p_items JSONB,
+  p_cash_amount NUMERIC DEFAULT 0,
+  p_change_amount NUMERIC DEFAULT 0
+)
+RETURNS VOID
+LANGUAGE plpgsql
+SECURITY DEFINER SET search_path = public, extensions
+AS $$
+DECLARE
+  item JSONB;
+  v_product_id TEXT;
+  v_qty NUMERIC;
+  v_current_stock NUMERIC;
+BEGIN
+  FOR item IN SELECT * FROM jsonb_array_elements(p_items)
+  LOOP
+    v_product_id := COALESCE(item->>'productId', item->>'id');
+    v_qty := (item->>'qty')::NUMERIC;
+
+    SELECT stock INTO v_current_stock
+    FROM public.items
+    WHERE id::TEXT = v_product_id
+    FOR UPDATE;
+
+    IF v_current_stock IS NULL THEN
+      RAISE EXCEPTION 'Produk dengan ID % tidak ditemukan di database.', v_product_id;
+    END IF;
+
+    IF v_current_stock < v_qty THEN
+      RAISE EXCEPTION 'Stok tidak mencukupi untuk produk ID %. Sisa stok: %', v_product_id, v_current_stock;
+    END IF;
+
+    UPDATE public.items
+    SET stock = stock - v_qty,
+        updated_at = NOW()
+    WHERE id::TEXT = v_product_id;
+  END LOOP;
+
+  INSERT INTO public.transactions (
+    id,
+    invoice_number,
+    sub_total,
+    discount_total,
+    tax_total,
+    total,
+    total_amount,
+    cash_amount,
+    change_amount,
+    payment_method,
+    cashier_id,
+    cashier_name,
+    items_json,
+    created_at
+  ) VALUES (
+    p_transaction_id,
+    p_invoice_number,
+    p_sub_total,
+    p_discount_total,
+    p_tax_total,
+    p_total,
+    p_total,
+    p_cash_amount,
+    p_change_amount,
+    p_payment_method,
+    p_cashier_id,
+    p_cashier_name,
+    p_items,
+    NOW()
+  );
+END;
+$$;
+
+-- Berikan hak akses eksekusi RPC yang diizinkan saja
+GRANT EXECUTE ON FUNCTION public.process_checkout TO authenticated;
+GRANT EXECUTE ON FUNCTION public.admin_reset_user_password TO authenticated;
+
+
+-- ==========================================
+-- 8. UPDATE USER LAMA (JIKA ADA "New User")
+-- ==========================================
+UPDATE public.users
+SET name = username
+WHERE name = 'New User' OR name IS NULL OR name = '';
+
+
+-- ==========================================
+-- 9. REFRESH SCHEMA CACHE
+-- ==========================================
+NOTIFY pgrst, 'reload schema';
